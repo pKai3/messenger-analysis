@@ -75,6 +75,7 @@ After setup and putting your full export in `data/`, double-click any `.command`
 |---|---|---|
 | `full-vs-year.command` | Full history vs past calendar year | `reports/full-vs-year/` |
 | `full-vs-6months.command` | Full history vs past six calendar months | `reports/full-vs-6months/` |
+| `year-vs-6months.command` | Past calendar year vs past six calendar months | `reports/year-vs-6months/` |
 | `year-vs-90days.command` | Past calendar year vs past 90 days | `reports/year-vs-90days/` |
 | `90days-vs-30days.command` | Past 90 days vs past 30 days | `reports/90days-vs-30days/` |
 
