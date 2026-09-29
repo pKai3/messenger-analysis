@@ -1,0 +1,22 @@
+# Private Messenger exports and derived reports
+/data/
+/reports/
+/outputs/
+/messenger_plots/
+chat_stats*.json
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
