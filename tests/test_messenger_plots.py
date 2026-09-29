@@ -114,12 +114,45 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(b['overall']['total_messages'],4)
         self.assertEqual(b['overall']['earliest_date'],'2025-09-29')
         self.assertEqual(analysis['comparison_mode'],'nested')
+        self.assertEqual(analysis['comparison_base'],'28 Sep 2024 - 28 Sep 2025')
+        self.assertEqual(analysis['datasets'][1]['timeframe'],'29 Sep 2025 - 29 Sep 2026')
+
+    def test_groups_excluded_consistently_and_can_be_included(self):
+        group=write(self.raw/'Group.json',thread('Group_1',['Me','Alice','Bob'],[message('Alice','group words','2027-01-01')]))
+        out=self.root/'reports';export=self.root/'filtered_default'
+        common=['--input',str(self.raw),'--me','Me','--out',str(out),'--summarize-only']
+        self.assertEqual(self.run_main(*common,'--export-b',str(export)),0)
+        a=m.read_json(out/'chat_stats_a.json');b=m.read_json(out/'chat_stats_b.json');analysis=m.read_json(out/'analysis.json')
+        self.assertEqual(a,self.summary)
+        self.assertEqual(b['overall']['total_messages'],4)
+        self.assertEqual(analysis['anchor_utc_date'],'2026-09-29')
+        self.assertFalse(analysis['include_groups']);self.assertFalse((export/group.name).exists())
+        full=m.summarize(self.files+[group]);self.assertEqual(m.scope_summary(full,False),self.summary)
+        summary_path=write(self.root/'cached.json',full)
+        self.assertEqual(self.run_main('--input',str(summary_path),'--window-b','none','--me','Me','--out',str(out),'--summarize-only'),0)
+        self.assertEqual(m.read_json(out/'chat_stats_a.json'),a)
+        export=self.root/'filtered_with_groups'
+        self.assertEqual(self.run_main(*common,'--include-groups','--export-b',str(export)),0)
+        self.assertEqual(m.read_json(out/'chat_stats_a.json')['overall']['total_messages'],6)
+        self.assertEqual(m.read_json(out/'analysis.json')['anchor_utc_date'],'2027-01-01')
+        self.assertTrue((export/group.name).exists())
+        bad=deepcopy(full);bad['overall']['total_messages']+=1
+        with self.assertRaises(m.InputError):m.scope_summary(bad,False)
+
+    def test_middle_comparison_names_both_remaining_date_ranges(self):
+        out=self.root/'middle'
+        self.assertEqual(self.run_main('--input',str(self.raw),'--me','Me','--out',str(out),'--summarize-only','--start-a','2024-01-01','--end-a','2026-12-31','--start-b','2025-01-01','--end-b','2025-12-31'),0)
+        analysis=m.read_json(out/'analysis.json')
+        self.assertEqual(analysis['comparison_base'],'01 Jan 2024 - 31 Dec 2024 and 01 Jan 2026 - 31 Dec 2026')
+        self.assertEqual(analysis['datasets'][1]['timeframe'],'01 Jan 2025 - 31 Dec 2025')
+        self.assertNotIn('A minus B',(out/'README.md').read_text())
 
     def test_disjoint_and_partially_overlapping_ranges(self):
         out=self.root/"reports"
         common=["--input",str(self.raw),"--me","Me","--out",str(out),"--summarize-only"]
         self.assertEqual(self.run_main(*common,"--start-a","2024-01-01","--end-a","2024-12-31","--start-b","2025-01-01","--end-b","2026-12-31"),0)
         self.assertEqual(m.read_json(out/"analysis.json")['comparison_mode'],'disjoint')
+        self.assertEqual(m.read_json(out/'analysis.json')['comparison_base'],'01 Jan 2024 - 31 Dec 2024')
         self.assertEqual(self.run_main(*common,"--start-a","2024-01-01","--end-a","2025-12-31","--start-b","2025-01-01","--end-b","2026-12-31"),0)
         self.assertEqual(m.read_json(out/"analysis.json")['comparison_mode'],'unavailable')
 
@@ -147,6 +180,33 @@ class PipelineTests(unittest.TestCase):
         path=write(self.root/"chat_stats_a.json",self.summary);before=path.read_bytes()
         self.assertEqual(self.run_main("--input",str(path),"--window-b","none","--me","Me","--out",str(self.root),"--summarize-only"),2)
         self.assertEqual(path.read_bytes(),before)
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"),"plotting dependencies unavailable")
+    def test_label_quadrants_and_marker_collisions_on_linear_and_log_axes(self):
+        out=self.root/'labels';out.mkdir()
+        plot=m.Plotter([m.prepare(self.summary,'Example','Me')],out,m.parse_args([]),'unavailable','',[])
+        try:
+            for logarithmic in (False,True):
+                fig,ax=plot.plt.subplots(figsize=(9,6))
+                rows=[dict(key=str(i),name=f'Person {i+1}',x=24+3*i,y=27+3*i) for i in range(15)]
+                ax.scatter([r['x'] for r in rows],[r['y'] for r in rows],s=70)
+                if logarithmic:ax.set_xscale('log');ax.set_yscale('log')
+                ax.set_xlim(10,100);ax.set_ylim(10,100)
+                labels=plot.annotations(ax,rows,'x','y',15);fig.canvas.draw()
+                self.assertEqual(len(labels),15)
+                marker_centres=ax.transData.transform([(r['x'],r['y']) for r in rows])
+                boxes=[]
+                for label in labels:
+                    dx,dy=label.get_position()
+                    self.assertTrue((dx<0 and dy>0) or (dx>0 and dy<0))
+                    self.assertEqual(label.get_ha(),'right' if dx<0 else 'left')
+                    self.assertEqual(label.get_va(),'bottom' if dy>0 else 'top')
+                    box=label.get_bbox_patch().get_window_extent(fig.canvas.get_renderer())
+                    self.assertFalse(any(box.contains(px,py) for px,py in marker_centres))
+                    self.assertFalse(any(box.overlaps(b) for b in boxes))
+                    boxes.append(box)
+                plot.plt.close(fig)
+        finally:plot.pdf.close()
 
     @unittest.skipUnless(importlib.util.find_spec("matplotlib"),"plotting dependencies unavailable")
     def test_sparse_and_empty_render_eight_charts(self):

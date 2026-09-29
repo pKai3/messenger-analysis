@@ -24,7 +24,7 @@ import tempfile
 import textwrap
 import zipfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # The supplied jq program, with shell quoting removed. The apostrophe in the
 # regex is literal: Python invokes jq directly, never through a shell.
@@ -159,7 +159,7 @@ def discover(path: Path, recursive=False, exclude_dir=None):
 FILTER_PROGRAM = 'map(.messages |= map(select(($start == null or .timestamp >= $start) and ($end == null or .timestamp < $end)))) |\n'
 
 
-def summarize(raw_files, jq="jq", start_ms=None, end_ms=None):
+def summarize(raw_files, jq="jq", start_ms=None, end_ms=None, include_groups=True):
     exe = shutil.which(jq)
     if not exe:
         raise InputError("jq was not found. Install jq (macOS: brew install jq), or pass an existing chat_stats JSON file.")
@@ -168,6 +168,8 @@ def summarize(raw_files, jq="jq", start_ms=None, end_ms=None):
     if start_ms is not None or end_ms is not None:
         command += ["--argjson", "start", json.dumps(start_ms), "--argjson", "end", json.dumps(end_ms)]
         program = FILTER_PROGRAM + program
+    if not include_groups:
+        program = "map(select((.participants | unique | length) <= 2)) |\n" + program
     # Spooling avoids command-line length limits and stderr/stdout pipe deadlocks.
     # jq -s still holds the complete dataset in memory, as in the supplied script.
     with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as output:
@@ -184,6 +186,37 @@ def summarize(raw_files, jq="jq", start_ms=None, end_ms=None):
             raise InputError("jq summary failed:\n" + proc.stderr.decode("utf-8", "replace").strip())
         output.seek(0)
         return json.load(output)
+
+
+def scope_summary(summary, include_groups):
+    """Apply the same thread selection to cached summaries without needing jq."""
+    if include_groups:
+        return summary
+    # Validate the original totals before rebuilding them, so filtering cannot
+    # conceal an inconsistent input summary. A sentinel owner needs no inference.
+    prepare(summary, "Input summary", "")
+    kept = [t for t in summary["threads"] if len(set(t["participants"])) <= 2]
+    if len(kept) == len(summary["threads"]):
+        return summary
+    overall = dict(summary["overall"])
+    overall["conversations"] = len(kept)
+    for total, field in [("total_messages","total_messages"),("total_words","total_words"),("total_media_messages","media_messages"),("total_reactions","total_reactions"),("total_unsent_messages","unsent_messages")]:
+        overall[total] = sum(t[field] for t in kept)
+    for prefix, field, fn in [("earliest","first_timestamp",min),("latest","last_timestamp",max)]:
+        values = [t[field] for t in kept if t[field] is not None]
+        stamp = fn(values) if values else None
+        overall[prefix+"_timestamp"] = stamp
+        overall[prefix+"_date"] = datetime.fromtimestamp(stamp/1000,timezone.utc).strftime("%Y-%m-%d") if stamp is not None else None
+    people = {}
+    for t in kept:
+        for p in t["people"]:
+            person = people.setdefault(p["name"],dict(name=p["name"],messages=0,words=0,media_messages=0,reactions_given=0))
+            for field in ("messages","words","media_messages","reactions_given"):
+                person[field] += p[field]
+    overall["messages_by_sender"] = sorted(people.values(),key=lambda p:(-p["messages"],p["name"]))
+    fields = ("thread_name","participants","total_messages","total_words","first_date","last_date","span_days","messages_per_day")
+    overall["largest_conversations"] = [{f:t[f] for f in fields} for t in kept]
+    return dict(overall=overall,threads=kept)
 
 
 def finite(x):
@@ -229,6 +262,7 @@ class Dataset:
     direct: list
     aggregate: dict
     warnings: list
+    timeframe: str = ""
 
     @property
     def active(self):
@@ -401,6 +435,47 @@ class Window:
         return f"{d(self.start) if self.start is not None else 'beginning'} through {d(self.end-1) if self.end is not None else 'latest message'} (UTC)"
 
 
+def period_text(start, end):
+    """Format a half-open period as inclusive calendar dates for chart text."""
+    if start is None or end is None or start >= end:
+        return "no dated messages"
+    date = lambda ms: datetime.fromtimestamp(ms/1000,timezone.utc).strftime("%d %b %Y")
+    first, last = date(start), date(end-1)
+    return first if first == last else f"{first} - {last}"
+
+
+def period_bounds(dataset, window):
+    # Explicit user-selected dates are retained even if no messages occur at
+    # their edges. A completely unbounded export uses its observed day range.
+    active = dataset.active
+    start = window.start
+    end = window.end
+    if start is None and active:
+        start = min(r['first_timestamp'] for r in active)//86400000*86400000
+    if end is None and active:
+        end = (max(r['last_timestamp'] for r in active)//86400000+1)*86400000
+    return start, end
+
+
+def comparison_dates(datasets, windows, mode):
+    for d,w in zip(datasets,windows):
+        d.timeframe = period_text(*period_bounds(d,w))
+    if len(datasets)<2:
+        return "no second timeframe"
+    if mode == "disjoint":
+        return datasets[0].timeframe
+    if mode != "nested":
+        return "no separate comparison period"
+    start,end = period_bounds(datasets[0],windows[0])
+    recent_start,recent_end = period_bounds(datasets[1],windows[1])
+    if any(v is None for v in (start,end,recent_start,recent_end)):
+        return "no dated comparison period"
+    periods=[]
+    if start < recent_start:periods.append(period_text(start,min(end,recent_start)))
+    if recent_end < end:periods.append(period_text(max(start,recent_end),end))
+    return " and ".join(periods) if periods else "no messages outside the selected comparison dates"
+
+
 def resolve_window(spec, anchor_ms, start=None, end=None, label=None):
     if spec == "none":
         if start is not None or end is not None:
@@ -454,10 +529,12 @@ def parse_args(argv=None):
     p.add_argument("--end-b", type=date_ms, metavar="YYYY-MM-DD", help="Inclusive UTC end date for B.")
     p.add_argument("--as-of", type=date_ms, metavar="YYYY-MM-DD", help="Anchor rolling windows to this UTC date instead of the latest exported message.")
     p.add_argument("--me", help="Your exact sender/participant name. Default: infer the most frequent participant.")
+    p.add_argument("--include-groups", action="store_true", help="Include threads with more than two distinct participants (excluded by default).")
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent/"reports", help="Output folder (default: script's reports/ folder).")
     p.add_argument("--all-label", "--label-a", dest="all_label", help="Override A's generated label.")
     p.add_argument("--recent-label", "--label-b", dest="recent_label", help="Override B's generated label.")
     p.add_argument("--top", type=int, default=12, help="Top conversations per dataset for volume/share/length plots (default: 12).")
+    p.add_argument("--scatter-labels", type=int, default=15, help="Names on each log-scale scatter plot (default: 15; 0 hides them).")
     p.add_argument("--min-messages", type=int, default=100, help="Minimum messages for directionality scatter (default: 100).")
     p.add_argument("--intensity-min", type=int, default=500, help="Minimum messages for media/reaction scatter (default: 500).")
     p.add_argument("--change-min", type=int, default=250, help="Minimum messages in EACH portion for change analysis (default: 250).")
@@ -473,6 +550,8 @@ def parse_args(argv=None):
         return args
     if not 1 <= args.top <= 30:
         p.error("--top must be between 1 and 30")
+    if not 0 <= args.scatter_labels <= 40:
+        p.error("--scatter-labels must be between 0 and 40")
     if any(getattr(args, k) < 1 for k in ("min_messages", "intensity_min", "change_min", "dpi")):
         p.error("thresholds and --dpi must be positive integers")
     if args.dpi > 600:
@@ -551,38 +630,54 @@ class Plotter:
 
     def panel_title(self,ax,d):
         ax.set_title(short(d.label,40),loc="left",fontweight="bold",fontsize=13,pad=21)
-        ax.text(0,1.015,d.dates,transform=ax.transAxes,fontsize=8,color=self.MUTED,va="bottom")
+        ax.text(0,1.015,d.timeframe+" UTC" if d.timeframe else d.dates,transform=ax.transAxes,fontsize=8,color=self.MUTED,va="bottom")
 
     def annotations(self,ax,rows,x,y,limit=4):
-        seen=set();boxes=[]
+        from matplotlib.transforms import Bbox
+        seen=set();boxes=[];labels=[];points=[]
         ax.figure.canvas.draw();renderer=ax.figure.canvas.get_renderer()
         bounds=ax.get_window_extent(renderer)
-        for i,r in enumerate(rows):
+        # Protect every scatter marker, including unlabelled points and the
+        # aggregate diamond. Work in display coordinates for log and linear axes.
+        for collection in ax.collections:
+            if not hasattr(collection,"get_sizes"):continue
+            offsets=collection.get_offset_transform().transform(collection.get_offsets())
+            sizes=collection.get_sizes()
+            paths=collection.get_paths()
+            for i,(px,py) in enumerate(offsets):
+                if not (self.np.isfinite(px) and self.np.isfinite(py)):continue
+                shape=max(abs(v) for v in paths[i%len(paths)].get_extents().extents) if paths else .5
+                radius=shape*math.sqrt(sizes[i%len(sizes)] if len(sizes) else 36)*ax.figure.dpi/72+3
+                points.append(Bbox.from_extents(px-radius,py-radius,px+radius,py+radius))
+        distances=sorted(((dx,dy) for dx in (10,18,30,46,66,90,120,160,210) for dy in (10,18,30,46,66,90,120,160)),key=lambda p:p[0]**2+p[1]**2)
+        candidates=[offset for dx,dy in distances for offset in ((-dx,dy),(dx,-dy))]
+        for r in rows:
             if r["key"] in seen:continue
             seen.add(r["key"])
             if len(seen)>limit:break
-            xf=ax.transAxes.inverted().transform(ax.transData.transform((r[x],r[y])))[0]
-            preferred=-1 if xf>.55 else 1
-            candidates=[(side*12,dy) for dy in (16,-22,34,-40,52,-58) for side in (preferred,-preferred)]
             best=None
+            ann=ax.annotate(short(r["name"],23),(r[x],r[y]),xytext=(-10,10),textcoords="offset points",fontsize=8.5,color=self.colors.get(r["key"],self.INK),arrowprops={"arrowstyle":"-","lw":.5,"color":self.MUTED},bbox={"facecolor":"white","edgecolor":"none","alpha":.94,"pad":1},zorder=6)
             for dx,dy in candidates:
-                ann=ax.annotate(short(r["name"],23),(r[x],r[y]),xytext=(dx,dy),textcoords="offset points",ha="right" if dx<0 else "left",fontsize=8.5,color=self.colors.get(r["key"],self.INK),arrowprops={"arrowstyle":"-","lw":.5,"color":self.MUTED},bbox={"facecolor":"white","edgecolor":"none","alpha":.94,"pad":1},zorder=6)
+                ann.set_position((dx,dy));ann.set_ha("right" if dx<0 else "left");ann.set_va("bottom" if dy>0 else "top")
                 ann.update_positions(renderer);ann.update_bbox_position_size(renderer)
                 rect=ann.get_bbox_patch().get_window_extent(renderer).expanded(1.05,1.2)
-                score=1000*sum(rect.overlaps(b) for b in boxes)
-                score+=10000*int(rect.x0<bounds.x0 or rect.x1>bounds.x1 or rect.y0<bounds.y0 or rect.y1>bounds.y1)
-                score+=abs(dy)*.01
+                collisions=10000*sum(rect.overlaps(p) for p in points)+2000*sum(rect.overlaps(b) for b in boxes)
+                collisions+=50000*int(rect.x0<bounds.x0 or rect.x1>bounds.x1 or rect.y0<bounds.y0 or rect.y1>bounds.y1)
+                score=collisions+math.hypot(dx,dy)*.01
                 if best is None or score<best[0]:
-                    if best is not None:best[1].remove()
-                    best=(score,ann,rect)
-                else:ann.remove()
-                if score<1:break
-            boxes.append(best[2])
+                    best=(score,dx,dy,rect)
+                if collisions==0:break
+            _,dx,dy,rect=best
+            ann.set_position((dx,dy));ann.set_ha("right" if dx<0 else "left");ann.set_va("bottom" if dy>0 else "top")
+            ann.update_positions(renderer);ann.update_bbox_position_size(renderer)
+            boxes.append(rect);labels.append(ann)
+        return labels
 
     def volume(self):
         rows=select_rows(self.datasets,self.args.top)
         insight=" | ".join(f"{d.label}: top {min(10,len(d.active))} threads contain {fmt(ratio(sum(r['total_messages'] for r in d.active[:10]),d.summary['overall']['total_messages'],100))}% of messages" for d in self.datasets)
-        fig=self.frame(1,"Conversation volume: messages and words",f"Union of the top {self.args.top} threads in each window; ordered by primary-window volume. Groups are included.",insight,"The windows may overlap: do not add their totals. Titles have only the final export-number suffix removed."," | ".join(describe(d) for d in self.datasets),len(rows))
+        scope="Groups are included." if self.args.include_groups else "Group chats are excluded."
+        fig=self.frame(1,"Conversation volume: messages and words",f"Union of the top {self.args.top} threads in each window; ordered by primary-window volume. {scope}",insight,"The windows may overlap: do not add their totals. Titles have only the final export-number suffix removed."," | ".join(describe(d) for d in self.datasets),len(rows))
         axes=[fig.add_axes([.19,.24,.335,.505]),fig.add_axes([.615,.24,.345,.505])]
         for ax,field,title in zip(axes,["total_messages","total_words"],["Messages","Words"]):
             if not rows:self.empty(ax);continue
@@ -606,8 +701,8 @@ class Plotter:
             ax.tick_params(axis="y",labelsize=9.5);ax.xaxis.set_major_formatter(self.Formatter(self.compact));self.grid(ax)
             ax.set_title(title,loc="left",fontsize=13,fontweight="bold",pad=14);ax.set_xlabel(f"Total {title.lower()}")
         if self.b:
-            label_a=f"A outside B" if self.mode=="nested" else short(self.a.label)
-            fig.legend(handles=[self.Patch(color=self.TEAL,label=short(self.b.label)),self.Patch(color=self.EARLIER,label=label_a)],loc="upper right",bbox_to_anchor=(.96,.79),ncol=2,frameon=False,fontsize=9)
+            label_a=self.comparison_name if self.mode=="nested" else self.a.timeframe
+            fig.legend(handles=[self.Patch(color=self.TEAL,label=self.b.timeframe),self.Patch(color=self.EARLIER,label=textwrap.fill(label_a,54))],loc="upper right",bbox_to_anchor=(.96,.79),ncol=2,frameon=False,fontsize=8)
         self.save(fig,1,"conversation_volume","Conversation volume")
 
     def shares(self):
@@ -656,7 +751,7 @@ class Plotter:
         insight="No eligible non-overlapping comparison is available. Other charts still compare the supplied windows directly."
         if rows:
             r=rows[0];insight=f"Largest absolute word-share change: {r['name']}, {r['old_w']:.1f}% to {r['new_w']:.1f}% ({r['delta_w']:+.1f} percentage points)."
-        fig=self.frame(4,"Changes in your share of the conversation",f"{self.comparison_name} versus {self.b.label if self.b else 'no second window'}. Minimum {self.args.change_min} messages in each portion.",insight,"Nested windows compare A minus B with B. Disjoint windows compare A with B. Partly overlapping windows do not support this non-overlapping comparison.")
+        fig=self.frame(4,"Changes in your share of the conversation",f"{self.comparison_name} versus {self.b.timeframe if self.b else 'no second timeframe'}. Minimum {self.args.change_min} messages in each period.",insight,"The two comparison periods do not overlap. When one timeframe contains the other, messages within the smaller timeframe are removed from the broader one before comparing shares. All dates are UTC.")
         axes=[fig.add_axes([.205,.24,.315,.50]),fig.add_axes([.62,.24,.315,.50])]
         for ax,f,title in zip(axes,["m","w"],["Messages","Words"]):
             if not rows:self.empty(ax,"No eligible chats. Adjust dates or --change-min; partly overlapping windows are not subtracted.");continue
@@ -669,7 +764,7 @@ class Plotter:
             ax.set_ylim(len(rows)-.4,-.7);ax.set_yticks(range(len(rows)),[short(r['name']) for r in rows] if f=='m' else []);self.grid(ax)
             ax.set_xlabel("Your share");ax.set_title(title,loc="left",fontsize=13,fontweight="bold",pad=16)
             ax.text(1,1.02,"Change (pp)",ha="right",transform=ax.transAxes,fontsize=8,color=self.MUTED)
-        if self.b:fig.legend(handles=[self.Line([],[],marker="o",ls="",markerfacecolor="white",markeredgecolor=self.MUTED,label=short(self.comparison_name)),self.Line([],[],marker="o",ls="",color=self.TEAL,label=short(self.b.label))],loc="upper right",bbox_to_anchor=(.95,.80),ncol=2,frameon=False,fontsize=9)
+        if self.b and self.mode in ("nested","disjoint"):fig.legend(handles=[self.Line([],[],marker="o",ls="",markerfacecolor="white",markeredgecolor=self.MUTED,label=textwrap.fill(self.comparison_name,54)),self.Line([],[],marker="o",ls="",color=self.TEAL,label=self.b.timeframe)],loc="upper right",bbox_to_anchor=(.95,.80),ncol=2,frameon=False,fontsize=8)
         self.save(fig,4,"changes_in_directionality","Changes in contribution")
 
     def word_volume(self):
@@ -685,12 +780,13 @@ class Plotter:
             for r in rows:ax.scatter(r['total_messages'],r['total_words'],s=35,color=self.colors.get(r['key'],self.TEAL),alpha=.65,edgecolor="white",lw=.4,zorder=3)
             ax.set_xlim(.8,xmax);ax.set_ylim(.8,ymax);ax.xaxis.set_major_formatter(self.Formatter(self.compact));ax.yaxis.set_major_formatter(self.Formatter(self.compact));ax.xaxis.set_minor_formatter(self.NullFormatter());ax.yaxis.set_minor_formatter(self.NullFormatter());ax.tick_params(which="minor",length=0)
             ax.set_xlabel("Messages (log scale)");ax.set_ylabel("Words (log scale)");self.grid(ax,"both");self.panel_title(ax,d)
-            self.annotations(ax,sorted(rows,key=lambda r:-r['total_words'])[:3],"total_messages","total_words",3)
+            self.annotations(ax,sorted(rows,key=lambda r:-r['total_words']),"total_messages","total_words",self.args.scatter_labels)
         self.save(fig,5,"words_versus_messages","Words versus messages")
 
     def intensity(self):
         minimum=self.args.intensity_min
-        fig=self.frame(6,"Reactions and media, adjusted for conversation size",f"Each point is a thread with at least {minimum} messages. Squares denote groups; dashed lines are dataset-wide rates.","Reaction events and media-containing messages describe different habits. A group can record multiple reactions to a single message.","Media counts nonempty media arrays, including failed downloads. Reactions are events, not the percentage of messages receiving a reaction.")
+        scope="Squares denote groups." if self.args.include_groups else "Group chats are excluded."
+        fig=self.frame(6,"Reactions and media, adjusted for conversation size",f"Each point is a thread with at least {minimum} messages. {scope} Dashed lines are dataset-wide rates.","Reaction events and media-containing messages describe different habits; rates allow conversations of different sizes to be compared.","Media counts nonempty media arrays, including failed downloads. Reactions are events, not the percentage of messages receiving a reaction.")
         eligible=[r for d in self.datasets for r in d.active if r['total_messages']>=minimum]
         xm=max([r['media_rate'] for r in eligible]+[1])*1.3;ym=max([r['reaction_rate'] for r in eligible]+[1])*1.3
         for ax,d in zip(self.panels(fig),self.datasets):
@@ -714,7 +810,7 @@ class Plotter:
             for r in reversed(d.active):ax.scatter(r['span_days'],r['messages_per_day'],s=20+math.sqrt(r['total_messages'])*.7,color=self.colors.get(r['key'],self.TEAL if r['total_messages']>=100 else self.EARLIER),alpha=.8,edgecolor="white",lw=.4,zorder=3)
             ax.set_yscale("log");ax.set_xlim(-xm*.02,xm);ax.set_ylim(ymin,ymax);ax.yaxis.set_major_formatter(self.Formatter(self.compact));ax.yaxis.set_minor_formatter(self.NullFormatter());ax.tick_params(which="minor",length=0)
             ax.set_xlabel("Observed conversation span (days)");ax.set_ylabel("Messages per day (log scale)");self.grid(ax,"both");self.panel_title(ax,d)
-            self.annotations(ax,d.active[:3],"span_days","messages_per_day",3)
+            self.annotations(ax,d.active,"span_days","messages_per_day",self.args.scatter_labels)
         self.save(fig,7,"duration_versus_activity","Observed span and activity")
 
     def word_length(self):
@@ -761,7 +857,7 @@ def write_json(path, value):
     path.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+"\n",encoding="utf-8")
 
 
-def export_filtered(raw_files, source_root, target, window, jq):
+def export_filtered(raw_files, source_root, target, window, jq, include_groups=False):
     """Optionally export filtered conversation JSON; do not copy media assets."""
     source_root=source_root.resolve();target=target.resolve()
     base=source_root if source_root.is_dir() else source_root.parent
@@ -769,6 +865,8 @@ def export_filtered(raw_files, source_root, target, window, jq):
         raise InputError("--export-b must be outside the raw input folder to avoid re-importing its filtered copies on the next run. Use reports/raw_window_b.")
     exe=shutil.which(jq)
     if not exe:raise InputError("jq is required for --export-b.")
+    if not include_groups:
+        raw_files=[p for p in raw_files if len(set(read_json(p)["participants"]))<=2]
     target.parent.mkdir(parents=True,exist_ok=True)
     program='.messages |= map(select(($start == null or .timestamp >= $start) and ($end == null or .timestamp < $end)))'
     with tempfile.TemporaryDirectory(prefix=".filtered-",dir=target.parent) as temp:
@@ -790,13 +888,14 @@ def export_filtered(raw_files, source_root, target, window, jq):
     return len(raw_files)
 
 
-def write_notes(path, datasets, owner, windows, mode, comparison_name, shift_rows, warnings, manifest):
+def write_notes(path, datasets, owner, windows, mode, comparison_name, shift_rows, warnings, manifest, include_groups=False):
     lines=["# Messenger analysis", "",f"Participant treated as 'you': **{owner}**.","", "| Metric | "+" | ".join(d.label.replace('|','/') for d in datasets)+" |", "|---|"+"---:|"*len(datasets)]
     specs=[("Messages",lambda d:f"{d.summary['overall']['total_messages']:,}"),("Words",lambda d:f"{d.summary['overall']['total_words']:,}"),("Threads in file",lambda d:str(len(d.rows))),("Nonempty threads",lambda d:str(len(d.active))),("Valid 1:1 chats",lambda d:str(len(d.direct))),("Your message share",lambda d:fmt(d.aggregate['message_share'],1,'%')),("Your word share",lambda d:fmt(d.aggregate['word_share'],1,'%')),("Your words/message",lambda d:fmt(d.aggregate['my_wpm'],2)),("Others' words/message",lambda d:fmt(d.aggregate['other_wpm'],2))]
     for name,fn in specs:lines.append("| "+name+" | "+" | ".join(fn(d) for d in datasets)+" |")
     lines += ["", "## Windows", ""]
     for i,d in enumerate(datasets):
-        lines.append(f"- **{d.label}**: observed {d.dates}. Requested filter: {windows[i].description()}.")
+        lines.append(f"- **{d.label}**: {d.timeframe} UTC; observed {d.dates}. Requested filter: {windows[i].description()}.")
+    lines.append("- Group chats are included in volume and intensity totals." if include_groups else "- Group chats (more than two distinct participants) are excluded from all summaries, plots, and filtered exports.")
     lines += ["", "## Findings", ""]
     for d in datasets:
         if not d.active:
@@ -806,7 +905,8 @@ def write_notes(path, datasets, owner, windows, mode, comparison_name, shift_row
         agg=d.aggregate;gap=ratio(agg['other_wpm'],agg['my_wpm']) if agg['other_wpm'] is not None and agg['my_wpm'] else None
         if gap is not None:lines.append(f"- {d.label}: other participants average {(gap-1)*100:+.1f}% words per message relative to you (weighted across 1:1 chats).")
     if shift_rows:
-        r=shift_rows[0];lines.append(f"- Largest eligible absolute word-share change, {comparison_name} to {datasets[-1].label}: {r['name']}, {r['old_w']:.1f}% to {r['new_w']:.1f}% ({r['delta_w']:+.1f} percentage points).")
+        r=shift_rows[0];lines.append(f"- Largest eligible absolute word-share change, {comparison_name} compared with {datasets[-1].timeframe}: {r['name']}, {r['old_w']:.1f}% to {r['new_w']:.1f}% ({r['delta_w']:+.1f} percentage points).")
+    comparison=f"Share changes compare {comparison_name} with {datasets[-1].timeframe} (UTC), using non-overlapping messages." if mode in ("nested","disjoint") else "The supplied timeframes do not support a separate, non-overlapping share-change comparison."
     lines += ["", "## Charts", ""]
     lines += [f"{x['number']}. {x['title']} - `{x['file']}`" for x in manifest]
     lines += ["", "## Definitions and validation", "",
@@ -819,7 +919,7 @@ def write_notes(path, datasets, owner, windows, mode, comparison_name, shift_row
         "- Words/message includes media and other non-text messages in its denominator. It is not the mean text-message length or a median.",
         "- Reactions are recorded events, not unique messages receiving a reaction. Media intensity counts messages with a nonempty media array; it does not verify attachment downloads.",
         "- Activity is messages / (span days + 1), including quiet gaps. Spans are bounded by the export/filter and are not relationship ages.",
-        f"- Comparison mode: {mode}. Nested windows compare A minus B against B; disjoint windows compare A against B. If neither applies, the change chart is an explanatory placeholder. Summary-only nestedness checks cannot prove message-level deduplication.",
+        f"- {comparison} Summary-only comparisons cannot prove message-level deduplication or recover the exact requested date boundaries; their labels use observed dates.",
         "- Totals, message-type counts, reaction-type counts, spans, and activity rates are validated. The data cannot establish initiation, reply times, active-day averages, sentiment, or completeness of lifetime history.",
         "- Optional raw filtered exports contain JSON only. Media folders/files are not copied, and existing media paths are left unchanged."]
     if warnings:lines += ["", "## Data notices", ""]+["- "+w for w in warnings]
@@ -837,18 +937,18 @@ def main(argv=None):
         notices=[]
         if skipped:notices.append(f"Ignored {len(skipped)} non-conversation JSON files (including existing summaries) in the input folder.")
         print(f"Reading {len(raw)} raw conversation files." if raw else "Reading supplied summary.",file=sys.stderr)
-        full=summary if summary is not None else summarize(raw,args.jq)
+        full=scope_summary(summary,args.include_groups) if summary is not None else summarize(raw,args.jq,include_groups=args.include_groups)
         anchor=args.as_of if args.as_of is not None else full['overall'].get('latest_timestamp')
         end_a=args.end_a if args.end_a is not None else args.as_of
         end_b=args.end_b if args.end_b is not None else args.as_of
         wa=resolve_window(args.window_a,anchor,args.start_a,end_a,args.all_label)
         wb=resolve_window(args.window_b,anchor,args.start_b,end_b,args.recent_label)
         if wa is None:raise InputError("Window A cannot be 'none'.")
-        if wa.label=="Custom window":wa.label="Window A"
-        if wb and wb.label=="Custom window":wb.label="Window B"
+        if wa.label=="Custom window":wa.label=period_text(wa.start,wa.end) if wa.start is not None and wa.end is not None else "Selected primary dates"
+        if wb and wb.label=="Custom window":wb.label=period_text(wb.start,wb.end) if wb.start is not None and wb.end is not None else "Selected comparison dates"
         if summary is not None and (wa.start is not None or wa.end is not None):
             raise InputError("A summary has no per-message timestamps. Use the full raw export to change timeframes.")
-        sa=full if wa.start is None and wa.end is None else summarize(raw,args.jq,wa.start,wa.end)
+        sa=full if wa.start is None and wa.end is None else summarize(raw,args.jq,wa.start,wa.end,args.include_groups)
         sb=None;separate=False
         if args.recent:
             if args.window_b=="none":raise InputError("--recent cannot be combined with --window-b none.")
@@ -857,43 +957,43 @@ def main(argv=None):
             other=args.recent.expanduser().resolve();existing,other_raw,other_skipped=discover(other,args.recursive,out)
             protected.update(p.resolve() for p in other_raw)
             if other.is_file():protected.add(other)
-            sb=existing if existing is not None else summarize(other_raw,args.jq)
+            sb=scope_summary(existing,args.include_groups) if existing is not None else summarize(other_raw,args.jq,include_groups=args.include_groups)
             wb=Window(args.recent_label or "Comparison export",None,None);separate=True
             if other_skipped:notices.append(f"Ignored {len(other_skipped)} non-conversation JSON files in the separate comparison input.")
         elif wb:
             if summary is not None:
                 raise InputError("Cannot derive a year from summary totals. Provide the full raw export, supply --recent with another summary, or choose --window-b none.")
             print(f"Filtering B: {wb.description()}.",file=sys.stderr)
-            sb=full if wb.start is None and wb.end is None else summarize(raw,args.jq,wb.start,wb.end)
+            sb=full if wb.start is None and wb.end is None else summarize(raw,args.jq,wb.start,wb.end,args.include_groups)
         if args.export_b and (not raw or wb is None or separate):
             raise InputError("--export-b requires one raw full-export input and an enabled window B.")
         owner=args.me or infer_owner([full])
         a=prepare(sa,wa.label,owner);b=prepare(sb,wb.label,owner) if sb is not None else None
         datasets=[a]+([b] if b else []);windows=[wa]+([wb] if b else [])
         if a.active and not any(owner in r['participants'] for r in a.rows):notices.append(f"Participant {owner!r} is absent from window A; directionality charts will be empty.")
-        mode="unavailable";comparison_name="A outside B"
+        mode="unavailable"
         if b and separate:
             nested,reasons=check_nested(a,b)
-            if nested:mode="nested";comparison_name="Earlier portion"
+            if nested:mode="nested"
             else:
                 # Disjoint observed ranges can still be compared without subtraction.
                 if a.active and b.active and (max(r['last_timestamp'] for r in a.active)<min(r['first_timestamp'] for r in b.active) or max(r['last_timestamp'] for r in b.active)<min(r['first_timestamp'] for r in a.active)):
-                    mode="disjoint";comparison_name=a.label
-                else:notices += ["Subtraction disabled: "+r for r in reasons]
+                    mode="disjoint"
+                else:notices += ["Separate-period comparison unavailable: "+r for r in reasons]
         elif b:
             lo=lambda w:float('-inf') if w.start is None else w.start
             hi=lambda w:float('inf') if w.end is None else w.end
             if lo(wa)<=lo(wb) and hi(wb)<=hi(wa):
                 mode="nested"
-                if not a.active or max(r['last_timestamp'] for r in a.active)<hi(wb):comparison_name="Earlier portion"
-            elif hi(wa)<=lo(wb) or hi(wb)<=lo(wa):mode="disjoint";comparison_name=a.label
-            else:notices.append("Windows partly overlap or B contains A; the change chart is unavailable. Put the broader window in A for subtraction.")
+            elif hi(wa)<=lo(wb) or hi(wb)<=lo(wa):mode="disjoint"
+        comparison_name=comparison_dates(datasets,windows,mode)
+        if b and mode=="unavailable":notices.append(f"{a.timeframe} and {b.timeframe} cannot be separated into comparison periods from these inputs. Select disjoint dates, or use the broader timeframe as the primary selection.")
         for d in datasets:notices += [f"{d.label}: {w}" for w in d.warnings]
         shift_rows=changes(a,b,mode,args.change_min)
-        analysis={"version":VERSION,"owner":owner,"comparison_mode":mode,"comparison_base":comparison_name,"anchor_utc_date":datetime.fromtimestamp(anchor/1000,timezone.utc).strftime('%Y-%m-%d') if anchor is not None else None,"warnings":notices,"changes":shift_rows,"datasets":[]}
+        analysis={"version":VERSION,"owner":owner,"include_groups":args.include_groups,"comparison_mode":mode,"comparison_base":comparison_name,"anchor_utc_date":datetime.fromtimestamp(anchor/1000,timezone.utc).strftime('%Y-%m-%d') if anchor is not None else None,"warnings":notices,"changes":shift_rows,"datasets":[]}
         for d,w in zip(datasets,windows):
             metrics=[{k:v for k,v in r.items() if k not in ('people','reaction_types','message_types','key')} for r in d.rows]
-            analysis['datasets'].append({"label":d.label,"requested_window":{"start_ms":w.start,"end_exclusive_ms":w.end,"description":w.description()},"observed_dates":d.dates,"overall":d.summary['overall'],"one_to_one":d.aggregate,"threads":metrics})
+            analysis['datasets'].append({"label":d.label,"timeframe":d.timeframe,"requested_window":{"start_ms":w.start,"end_exclusive_ms":w.end,"description":w.description()},"observed_dates":d.dates,"overall":d.summary['overall'],"one_to_one":d.aggregate,"threads":metrics})
         out.parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".messenger-build-",dir=out.parent) as stage_dir:
             stage=Path(stage_dir)
@@ -905,7 +1005,7 @@ def main(argv=None):
                 print("Rendering eight charts and the PDF report...",file=sys.stderr)
                 manifest=Plotter(datasets,stage,args,mode,comparison_name,shift_rows).run()
             write_json(stage/'chart_manifest.json',manifest)
-            write_notes(stage/'README.md',datasets,owner,windows,mode,comparison_name,shift_rows,notices,manifest)
+            write_notes(stage/'README.md',datasets,owner,windows,mode,comparison_name,shift_rows,notices,manifest,args.include_groups)
             if manifest:
                 with zipfile.ZipFile(stage/'Messenger_charts.zip','w',compression=zipfile.ZIP_DEFLATED) as z:
                     for item in manifest:z.write(stage/item['file'],item['file'])
@@ -914,7 +1014,7 @@ def main(argv=None):
                 if (out/p.name).resolve() in protected:raise InputError(f"Output would overwrite an input: {out/p.name}. Choose another --out folder.")
             if args.export_b:
                 export_target=args.export_b.expanduser().resolve()
-                n=export_filtered(raw,source,export_target,wb,args.jq)
+                n=export_filtered(raw,source,export_target,wb,args.jq,args.include_groups)
                 print(f"Exported {n} filtered conversation JSON files to {export_target}",file=sys.stderr)
             out.mkdir(parents=True,exist_ok=True)
             # Remove only our stale B summary after a previous two-window run.
@@ -922,7 +1022,7 @@ def main(argv=None):
             stale_b=out/'chat_stats_b.json'
             prior_analysis=out/'analysis.json'
             if sb is None and stale_b.is_file() and stale_b.resolve() not in protected and prior_analysis.is_file():
-                try:owned=read_json(prior_analysis).get('version')==VERSION
+                try:owned=read_json(prior_analysis).get('version') in ("1.0.0",VERSION)
                 except (InputError,AttributeError):owned=False
                 if owned:stale_b.unlink()
             for p in stage.iterdir():os.replace(p,out/p.name)
